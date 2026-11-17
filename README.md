@@ -55,6 +55,7 @@ IMAP_PORT=1143 IMAP_ACCOUNT=lab@demo AUTO_SCAN_INTERVAL=0 \
 | 复用 UID 不套旧回执 | 主键含 `uidvalidity`；标记前比对 UID 当前内容的 SHA-256，不一致则拒绝标记并转 `stale` |
 | 两实例并发 / 旧扫描不推进新进度 | `mailbox_state` 中的扫描租约（token + 心跳）；`set_progress`、`finish_scan`、标记全部以 token 与 uidvalidity 为条件 |
 | 标记后断连可演示 | 演示源 `POST /ctl/drop-store`：STORE 已生效但连接在回复前被关闭 |
+| 投递原文逐字节保真 | 演示源 `deliver` 直写原始字节、FETCH 直读文件、标记已读仅重命名 Maildir 文件；`/ctl/raw` 回传 `sha256` 供核对（`tests/test_raw_fidelity.py`） |
 | 网页：采集 / 重试 / 拒收原因 / 待标记 | `GET /`、`POST /actions/scan`、`POST /actions/retry-marks`、`?mark=pending` 过滤；API 见下 |
 
 ### 关键不变式
@@ -93,7 +94,10 @@ SHA-256、附件 SHA-256 与全部数据行，可脱离数据库核对。
 | GET | `/api/messages/{id}/receipt` | 下载固定回执 JSON |
 | GET | `/api/reports/{id}/attachment` | 下载 CSV 原件 |
 
-演示源控制 API（`demo-imap:8081`）：`POST /ctl/deliver` 投递、`POST /ctl/rebuild`
+演示源控制 API（`demo-imap:8081`）：`POST /ctl/deliver` 投递演示邮件、
+`POST /ctl/raw` 以请求体原文投递完整 RFC822（响应回传 `sha256`/`bytes`，
+演示源逐字节保存，FETCH 原样下发，标记已读只改文件名不改内容，因此采集下载的
+`.eml` 与回执 `raw_sha256` 恒等于投递原文）、`POST /ctl/rebuild`
 （`{"purge":false}` 重建 UIDVALIDITY 并重排 UID）、`POST /ctl/drop-store`
 （下一次 STORE 生效后断连）、`GET /api/state`。
 

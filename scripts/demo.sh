@@ -39,6 +39,57 @@ deliver '{"subject":"演示-双附件","attachments":[
   {"filename":"DEMO-R2.csv","report_no":"DEMO-R2","sample_no":"S002","item":"GLU","value":"5.4"}]}'
 curl -fsS -X POST "$APP_A/api/scan" | json
 
+step "1b. /ctl/raw 投递 CRLF 原件：下载字节与回执摘要必须等于投递原文"
+# 归档员直接投递一封完整 RFC822（CRLF 行尾 + 折行头 + base64 CSV）。
+RAW_FILE="$(mktemp /tmp/raw-demo-XXXXXX.eml)"
+python3 - "$RAW_FILE" <<'PY'
+import base64, sys
+csv = "报告号,样本号,项目,测值\r\nDEMO-RAW1,S100,ALT,18\r\n".encode("utf-8")
+raw = (
+    b"From: Archivist <archivist@lab.example>\r\n"
+    b"To: Warehouse <warehouse@lab.example>\r\n"
+    b"Subject: =?utf-8?b?5b2x5qOA6rK85ZGY5qy+5YC8?=\r\n"
+    b"\t folded-subject-tail\r\n"
+    b"Date: Mon, 16 Nov 2026 10:00:00 +0000\r\n"
+    b"Message-ID: <demo-raw-1@lab.example>\r\n"
+    b"MIME-Version: 1.0\r\n"
+    b"Content-Type: multipart/mixed;\r\n"
+    b"\tboundary=\"raw-boundary\"\r\n"
+    b"\r\n"
+    b"--raw-boundary\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"\r\n"
+    b"see attachment.\r\n"
+    b"--raw-boundary\r\n"
+    b"Content-Type: text/csv; name=\"DEMO-RAW1.csv\"\r\n"
+    b"Content-Disposition: attachment; filename=\"DEMO-RAW1.csv\"\r\n"
+    b"Content-Transfer-Encoding: base64\r\n"
+    b"\r\n" + base64.encodebytes(csv).replace(b"\n", b"\r\n") +
+    b"--raw-boundary--\r\n"
+)
+open(sys.argv[1], "wb").write(raw)
+PY
+DELIVER_SHA=$(sha256sum "$RAW_FILE" | cut -d' ' -f1)
+echo "投递原文 SHA-256: $DELIVER_SHA"
+curl -fsS -X POST "$DEMO/ctl/raw" -H 'Content-Type: message/rfc822' \
+  --data-binary "@$RAW_FILE" | python3 -c "import json,sys
+d=json.load(sys.stdin); print(json.dumps(d, ensure_ascii=False))
+assert d['sha256']=='$DELIVER_SHA', 'demo source stored different bytes'"
+curl -fsS -X POST "$APP_A/api/scan" | json
+MSG_ID=$(curl -fsS "$APP_A/api/messages" | python3 -c "import json,sys
+rows=json.load(sys.stdin)
+hit=[r for r in rows if r['raw_sha256']=='$DELIVER_SHA']
+assert hit, 'collected message not found by delivered sha256'
+print(hit[0]['id'])")
+curl -fsS "$APP_A/api/messages/$MSG_ID/original" -o /tmp/raw-demo-download.eml
+DOWNLOAD_SHA=$(sha256sum /tmp/raw-demo-download.eml | cut -d' ' -f1)
+curl -fsS "$APP_A/api/messages/$MSG_ID/receipt" | python3 -c "import json,sys
+r=json.load(sys.stdin)
+assert r['raw_sha256']=='$DELIVER_SHA', 'receipt digest mismatch'
+print('回执 raw_sha256 一致:', r['raw_sha256'][:16] + '…')"
+test "$DELIVER_SHA" = "$DOWNLOAD_SHA"
+echo "下载原件 SHA-256 一致: $DOWNLOAD_SHA"
+
 step "2. 人工已读（模拟有人在邮箱里先打开）仍会被采集"
 deliver '{"subject":"演示-人工已读","attachments":[
   {"filename":"DEMO-R3.csv","report_no":"DEMO-R3","sample_no":"S003","item":"K","value":"4.1"}]}'

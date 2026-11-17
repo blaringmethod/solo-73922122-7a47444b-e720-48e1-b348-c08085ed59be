@@ -7,6 +7,11 @@ collector and the web UI:
 * ``CAPABILITY``, ``LOGIN``, ``LOGOUT``, ``NOOP``, ``SELECT``/``EXAMINE``,
   ``STATUS``, ``UID SEARCH``, ``UID FETCH``, ``UID STORE``;
 * UIDVALIDITY and UIDNEXT are real and persist across restarts;
+* messages are byte-preserving end to end: delivery stores the exact RFC822
+  bytes it was given (CRLF, folded headers, MIME boundaries untouched),
+  ``FETCH`` serves the file verbatim, and flag changes only rename the
+  Maildir file — so the SHA-256 of a downloaded original always equals the
+  SHA-256 of the delivered bytes;
 * ``GET /`` shows a small HTML console, ``POST /ctl/*`` drives the demo:
   deliver a message, rebuild the mailbox (new UIDVALIDITY, UIDs restart at 1),
   make the next ``UID STORE`` succeed and then drop the connection before
@@ -19,12 +24,14 @@ untrusted network.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
-import mailbox
 import os
+import secrets
 import socketserver
 import threading
+import time
 from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.message import EmailMessage
@@ -35,9 +42,40 @@ from typing import Any
 from urllib.parse import urlparse
 
 
+# Maildir info-letter for each IMAP system flag the demo understands.  Flags
+# live in the file name (``cur/<uniq>:2,FLAGS``), which is why marking a
+# message never has to touch its bytes.
+_FLAG_TO_LETTER = {
+    "\\Answered": "R",
+    "\\Deleted": "T",
+    "\\Draft": "D",
+    "\\Flagged": "F",
+    "\\Seen": "S",
+}
+_LETTER_TO_FLAG = {letter: flag for flag, letter in _FLAG_TO_LETTER.items()}
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 @dataclass
 class MailboxStore:
     """Maildir-backed mailbox with stable UID bookkeeping.
+
+    The store is byte-preserving end to end:
+
+    * ``deliver`` writes the exact RFC822 bytes it received — nothing is
+      parsed and re-serialised, so CRLF line endings, folded headers and
+      MIME boundaries survive intact;
+    * ``message_by_uid`` reads the file back verbatim for ``FETCH``;
+    * ``set_flag`` only renames the file (Maildir flags live in the file
+      name), so marking ``\\Seen`` — immediately, on retry after a dropped
+      connection, or after a restart — can never rewrite the message body.
 
     UIDs are attached to Maildir keys (filenames), not to positional indexes,
     so flag changes (which rename the file) and new deliveries never remap an
@@ -54,6 +92,7 @@ class MailboxStore:
     lock: threading.RLock = field(default_factory=threading.RLock)
     drop_next_store: bool = False
     store_count: int = 0
+    _uniq_counter: int = 0
 
     def __post_init__(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -67,10 +106,10 @@ class MailboxStore:
     def maildir(self) -> Path:
         return self.root / "maildir"
 
+    # ------------------------------------------------------------ persistence
     def _load(self) -> None:
-        self.maildir.mkdir(parents=True, exist_ok=True)
         for sub in ("cur", "new", "tmp"):
-            (self.maildir / sub).mkdir(exist_ok=True)
+            (self.maildir / sub).mkdir(parents=True, exist_ok=True)
         if self.meta_path.exists():
             meta = json.loads(self.meta_path.read_text("utf-8"))
             self.uidvalidity = int(meta.get("uidvalidity", 1))
@@ -81,20 +120,39 @@ class MailboxStore:
         self._flush()
 
     def _flush(self) -> None:
-        self.meta_path.write_text(
-            json.dumps(
-                {
-                    "uidvalidity": self.uidvalidity,
-                    "uidnext": self.uidnext,
-                    "uid_map": {str(k): v for k, v in self.uid_map.items()},
-                },
-                indent=2,
-            ),
-            "utf-8",
+        payload = json.dumps(
+            {
+                "uidvalidity": self.uidvalidity,
+                "uidnext": self.uidnext,
+                "uid_map": {str(k): v for k, v in self.uid_map.items()},
+            },
+            indent=2,
         )
+        tmp = self.meta_path.with_name(self.meta_path.name + ".tmp")
+        tmp.write_text(payload, "utf-8")
+        os.replace(tmp, self.meta_path)
 
-    def box(self) -> mailbox.Maildir:
-        return mailbox.Maildir(str(self.maildir), factory=None, create=True)
+    # ------------------------------------------------------------- maildir io
+    def _scan_keys(self) -> list[str]:
+        """All message keys: ``uniq`` in ``new/``, ``uniq:2,FLAGS`` in ``cur/``."""
+        keys: list[str] = []
+        for sub in ("cur", "new"):
+            for entry in (self.maildir / sub).iterdir():
+                if entry.is_file() and not entry.name.startswith("."):
+                    keys.append(entry.name)
+        return sorted(keys)
+
+    def _key_path(self, key: str) -> Path:
+        sub = "cur" if ":" in key else "new"
+        path = self.maildir / sub / key
+        if path.exists():
+            return path
+        # Tolerate layouts that keep flagless messages in cur/.
+        for sub in ("cur", "new"):
+            candidate = self.maildir / sub / key
+            if candidate.exists():
+                return candidate
+        return path
 
     @staticmethod
     def _strip_flags(key: str) -> str:
@@ -102,78 +160,114 @@ class MailboxStore:
         # a flag update potentially renames a file.
         return key.split(":", 1)[0]
 
+    @staticmethod
+    def _letters_of_key(key: str) -> set[str]:
+        info = key.split(":", 1)[1] if ":" in key else ""
+        if not info.startswith("2,"):
+            return set()
+        return set(info[2:])
+
+    @classmethod
+    def _flags_of_key(cls, key: str) -> set[str]:
+        return {
+            _LETTER_TO_FLAG[letter]
+            for letter in cls._letters_of_key(key)
+            if letter in _LETTER_TO_FLAG
+        }
+
+    def _new_uniq(self) -> str:
+        self._uniq_counter += 1
+        return (
+            f"{time.time_ns()}.{os.getpid()}.{self._uniq_counter}"
+            f".{secrets.token_hex(4)}"
+        )
+
     def _ensure_uids(self) -> None:
-        box = self.box()
-        keys = sorted(box.keys())
-        known = set(self.key_uid)
-        stripped = {self._strip_flags(k) for k in known}
-        for key in keys:
-            if key in known:
-                continue
-            base = self._strip_flags(key)
-            match = next((k for k in known if self._strip_flags(k) == base), None)
-            if match is not None:
-                uid = self.key_uid.pop(match)
-                self.key_uid[key] = uid
+        with self.lock:
+            keys = self._scan_keys()
+            known = set(self.key_uid)
+            stripped = {self._strip_flags(k) for k in known}
+            for key in keys:
+                if key in known:
+                    continue
+                base = self._strip_flags(key)
+                match = next((k for k in known if self._strip_flags(k) == base), None)
+                if match is not None:
+                    uid = self.key_uid.pop(match)
+                    self.key_uid[key] = uid
+                    self.uid_map[uid] = key
+                    known.discard(match)
+                    known.add(key)
+                    continue
+                if base in stripped:
+                    continue
+                uid = self.uidnext
+                self.uidnext += 1
                 self.uid_map[uid] = key
-                known.discard(match)
+                self.key_uid[key] = uid
                 known.add(key)
-                continue
-            if base in stripped:
-                continue
-            uid = self.uidnext
-            self.uidnext += 1
-            self.uid_map[uid] = key
-            self.key_uid[key] = uid
-            known.add(key)
-            stripped.add(base)
-        # Drop mappings whose file disappeared.
-        for key in list(self.key_uid):
-            if key not in keys:
-                uid = self.key_uid.pop(key)
-                self.uid_map.pop(uid, None)
-        self._flush()
+                stripped.add(base)
+            # Drop mappings whose file disappeared.
+            for key in list(self.key_uid):
+                if key not in keys:
+                    uid = self.key_uid.pop(key)
+                    self.uid_map.pop(uid, None)
+            self._flush()
 
     def deliver(self, raw: bytes) -> int:
-        msg = message_from_bytes(raw, policy=default_policy)
+        """Store *exactly* the bytes received and return the assigned UID."""
         with self.lock:
-            box = self.box()
-            key = box.add(msg)
-            box.flush()
+            uniq = self._new_uniq()
+            tmp_path = self.maildir / "tmp" / uniq
+            with open(tmp_path, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.maildir / "new" / uniq)
+            _fsync_dir(self.maildir / "new")
             self._ensure_uids()
-            return self.key_uid[key]
-
-    @staticmethod
-    def _flag_set(msg) -> set[str]:
-        raw = msg.get_flags()
-        if isinstance(raw, str):
-            return {part for part in raw.split() if part}
-        return {str(part) for part in raw}
+            return self.key_uid[uniq]
 
     def message_by_uid(self, uid: int):
+        """Return ``(key, raw_bytes, flags)``; the bytes are the file verbatim."""
         with self.lock:
-            box = self.box()
             key = self.uid_map.get(uid)
             if key is None:
                 return None
             try:
-                msg = box.get_message(key)
-            except KeyError:
+                raw = self._key_path(key).read_bytes()
+            except FileNotFoundError:
                 return None
-            return key, msg, self._flag_set(msg)
+            return key, raw, self._flags_of_key(key)
 
     def set_flag(self, uid: int, flag: str, add: bool = True) -> bool:
+        """Add/remove a flag by *renaming* the file; content is never touched."""
+        letter = _FLAG_TO_LETTER.get(flag)
+        if letter is None:
+            return False
         with self.lock:
-            box = self.box()
             key = self.uid_map.get(uid)
-            if key is None or key not in box:
+            if key is None:
                 return False
-            msg = box.get_message(key)
-            flags = self._flag_set(msg)
-            flags.add(flag) if add else flags.discard(flag)
-            msg.set_flags(tuple(sorted(flags)))
-            box[key] = msg
-            box.flush()
+            path = self._key_path(key)
+            if not path.exists():
+                return False
+            letters = self._letters_of_key(key)
+            if add:
+                letters.add(letter)
+            else:
+                letters.discard(letter)
+            base = self._strip_flags(key)
+            if letters:
+                new_key = f"{base}:2,{''.join(sorted(letters))}"
+                new_path = self.maildir / "cur" / new_key
+            else:
+                new_key = base
+                new_path = self.maildir / "new" / new_key
+            if new_path != path:
+                os.replace(path, new_path)
+                _fsync_dir(new_path.parent)
+                _fsync_dir(path.parent)
             self._ensure_uids()
             return True
 
@@ -185,14 +279,13 @@ class MailboxStore:
         scenario the collector must not confuse with the old message.
         """
         with self.lock:
-            box = self.box()
             if purge:
-                for key in list(box.keys()):
-                    del box[key]
-                box.flush()
                 for sub in ("cur", "new", "tmp"):
-                    for path in (self.maildir / sub).glob("*"):
-                        path.unlink(missing_ok=True)
+                    directory = self.maildir / sub
+                    for path in directory.glob("*"):
+                        if path.is_file():
+                            path.unlink()
+                    _fsync_dir(directory)
             self.uidvalidity += 1
             self.uidnext = 1
             self.uid_map = {}
@@ -207,21 +300,29 @@ class MailboxStore:
     def all_flags(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         with self.lock:
-            box = self.box()
             for uid in sorted(self.uid_map):
                 key = self.uid_map[uid]
                 try:
-                    msg = box.get_message(key)
-                except KeyError:
+                    raw = self._key_path(key).read_bytes()
+                except FileNotFoundError:
                     continue
                 out.append(
                     {
                         "uid": uid,
-                        "flags": sorted(self._flag_set(msg)),
-                        "subject": str(msg.get("Subject", "")),
+                        "flags": sorted(self._flags_of_key(key)),
+                        "subject": _subject_of(raw),
                     }
                 )
         return out
+
+
+def _subject_of(raw: bytes) -> str:
+    """Best-effort Subject for the console; parsing never alters the file."""
+    try:
+        msg = message_from_bytes(raw, policy=default_policy)
+        return str(msg.get("Subject", "") or "")
+    except Exception:  # noqa: BLE001 - display only
+        return ""
 
 
 class IMAPSession(socketserver.StreamRequestHandler):
@@ -346,10 +447,11 @@ class IMAPSession(socketserver.StreamRequestHandler):
         if found is None:
             self._send(tag + b" OK FETCH completed\r\n")
             return
-        _key, msg, flags = found
-        raw = msg.as_bytes(policy=default_policy)
+        _key, raw, flags = found
         flags_str = " ".join(sorted(flags)).encode()
         if "BODY.PEEK" in spec.upper() or "RFC822" in spec.upper():
+            # The literal is the verbatim file content: what the collector
+            # hashes and archives is exactly what was delivered.
             self._send(
                 b"* 1 FETCH (UID " + str(uid).encode() + b" FLAGS (" + flags_str + b")"
                 + b" BODY[] {" + str(len(raw)).encode() + b"}\r\n" + raw + b")\r\n"
@@ -455,7 +557,15 @@ def build_control_handler(store: MailboxStore, imap_port: int):
                 payload = json.loads(body or b"{}")
                 raw = build_demo_mail(payload)
                 uid = store.deliver(raw)
-                self._json({"ok": True, "uid": uid, "uidvalidity": store.uidvalidity})
+                self._json(
+                    {
+                        "ok": True,
+                        "uid": uid,
+                        "uidvalidity": store.uidvalidity,
+                        "bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                )
                 return
             if path == "/ctl/rebuild":
                 payload = json.loads(body or b"{}")
@@ -467,9 +577,19 @@ def build_control_handler(store: MailboxStore, imap_port: int):
                 self._json({"ok": True, "drop_next_store": store.drop_next_store})
                 return
             if path == "/ctl/raw":
-                raw = body
-                uid = store.deliver(raw)
-                self._json({"ok": True, "uid": uid})
+                # Byte-exact delivery: the request body *is* the RFC822
+                # message.  The response echoes its SHA-256 so the caller
+                # can verify the archived original against what was posted.
+                uid = store.deliver(body)
+                self._json(
+                    {
+                        "ok": True,
+                        "uid": uid,
+                        "uidvalidity": store.uidvalidity,
+                        "bytes": len(body),
+                        "sha256": hashlib.sha256(body).hexdigest(),
+                    }
+                )
                 return
             self._json({"error": "not found"}, 404)
 
